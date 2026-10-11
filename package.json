@@ -1,0 +1,23 @@
+{
+  "name": "engram-memory",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "main": "./index.js",
+  "exports": {
+    ".": {
+      "import": "./index.js",
+      "default": "./index.js"
+    }
+  },
+  "description": "OpenCode V2 session capture for a local Engram server",
+  "license": "MIT",
+  "repository": "github:Thiago-P05/engram-memory",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@opencode/plugin": "2.0.26"
+  }
+}

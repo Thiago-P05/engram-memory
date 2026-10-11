@@ -1,0 +1,11 @@
+
+node_modules/
+.git/
+.cache/
+logs/
+.env*
+*.log
+*.pem
+*.key
+opencode.json
+opencode.jsonc
