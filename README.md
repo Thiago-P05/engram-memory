@@ -2,6 +2,12 @@
 
 OpenCode V2 server plugin that automatically sends parent-session prompts and non-error `subagent` tool results to a local Engram HTTP server. **Enable only if you consent to storing that content.**
 
+## Screenshots
+
+![Engram memory list](docs/images/engram-memory-1.png)
+
+![Engram memory details](docs/images/engram-memory-2.png)
+
 ## Install
 
 Requires OpenCode V2 (official plugin API 2.0.26), Node.js 22+ for setup/tests, and a separately managed Engram server exposing `/sessions`, `/prompts`, and `/observations/passive` on loopback port 7437 (override with `ENGRAM_PORT`). This plugin neither installs nor starts Engram.
