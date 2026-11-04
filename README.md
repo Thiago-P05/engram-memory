@@ -12,6 +12,8 @@ OpenCode V2 server plugin that automatically sends parent-session prompts and no
 
 Requires OpenCode V2 (official plugin API 2.0.26), Node.js 22+ for setup/tests, and a separately managed Engram server exposing `/sessions`, `/prompts`, and `/observations/passive` on loopback port 7437 (override with `ENGRAM_PORT`). This plugin neither installs nor starts Engram.
 
+Git is needed to resolve identities inside checkouts unless the session directory itself has an Engram project configuration.
+
 ```sh
 git clone https://github.com/Thiago-P05/engram-memory.git
 cd engram-memory
@@ -34,13 +36,16 @@ No npm release is required. The official `@opencode/plugin` dependency replaces 
 
 - Set `options.enabled` to `false`, or set `ENGRAM_CAPTURE_DISABLED=1` in the server environment before plugin setup, then reload the plugin using OpenCode's normal lifecycle. Opt-out prevents subscriptions, hook registration, HTTP requests and session metadata capture. Removing the plugin entry also disables capture.
 - Captures session ID, project name and working directory; prompts whose redacted text exceeds 10 characters are truncated to 2,000 characters. `subagent` output whose status is not `error` and whose redacted text exceeds 50 characters is **not truncated**. This status check also accepts a missing status; it is not proof of success. Other tools increment an in-memory count, not stored result content.
-- Child sessions observed through `session.created` are skipped. A child already running before subscription may not be known; this is not an isolation/security boundary.
+- Before capturing, the plugin reads the current `Session.Info` for that session. A session with `parentID` is skipped even when its creation event was missed; sessions already identified as children remain skipped after deletion. If lookup fails, returns a different ID, or its location cannot be resolved, capture is skipped. This is not a security boundary against incorrect or incomplete session information.
+- Each parent session uses its own current, canonical working directory. A valid `.engram/config.json` with `project_name` in that directory takes precedence; within a Git checkout the nearest such configuration up to the checkout root is used, then the primary checkout's configuration for a linked worktree. Otherwise the checkout or directory basename is lowercased. Invalid present configuration, ambiguous directories, or Git lookup failure prevent capture rather than choosing an unrelated project; these failures before registration can be retried. Session moves and project changes trigger re-registration.
+- A failed registration skips that capture but a later operation can retry. Concurrent operations for the same session are not serialized; a delayed registration or a session move may cause the server's identity to differ from the capture's intended identity. The plugin cannot guarantee ordering, including after timeouts or across plugin instances. Disabling or removing the plugin stops future capture but does not undo an in-flight request or erase previously stored records.
 - `<private>...</private>` content is replaced with `[REDACTED]` (malformed/nested tags have tests). This is **not a general secret detector**: unmarked credentials, personal data and secrets can be stored. Redaction affects this plugin's copy, not OpenCode's original history or other plugins.
-- Uses unauthenticated HTTP to `127.0.0.1`; HTTP failures/timeouts are ignored. Do not treat capture as guaranteed delivery. Protect the local service and its database.
+- Uses unauthenticated HTTP to `127.0.0.1`; capture delivery failures/timeouts are ignored. Do not treat capture as guaranteed delivery. Protect the local service and its database. This public package does not read or validate machine-specific remote tunnel settings; configure a loopback listener and port separately.
+- `ENGRAM_PORT` must be a decimal port from 1 to 65535; an unset or blank value uses 7437. An invalid value disables capture at setup without falling back to another port. After setup, the port is rechecked on each operation; invalid values skip capture, and a changed valid port causes re-registration.
 - No retention, deletion or encryption policy is implemented here. Engram controls storage and retention; disabling capture or deleting an OpenCode session does **not** erase prior Engram records. Review and delete retained data using your Engram administration tools.
 
 ## Checks
 
-`npm test` uses fake contexts/events and mocked HTTP. No real Engram server or credentials are needed. Official package import/setup is tested; live OpenCode integration remains a separate manual check.
+`npm test` uses fake contexts/events, temporary filesystem fixtures and mocked HTTP; some identity tests invoke Git. No real Engram server or credentials are needed. Official package import/setup is tested; live OpenCode integration remains a separate manual check.
 
 MIT — [LICENSE](LICENSE). [Repository](https://github.com/Thiago-P05/engram-memory) · [V2 plugin API](https://opencode.ai/v2/docs/build/plugins).

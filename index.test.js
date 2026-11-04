@@ -1,223 +1,157 @@
-import test, { describe } from 'node:test'
+import test from 'node:test'
 import assert from 'node:assert/strict'
-import { readFile } from 'node:fs/promises'
+import { readFile, mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
-import { fileURLToPath, pathToFileURL } from 'node:url'
+import { fileURLToPath } from 'node:url'
+import plugin, { privateText } from './index.js'
 
 const root = dirname(fileURLToPath(import.meta.url))
 
-test('package.json declares official @opencode/plugin without install hooks', async () => {
+async function fixture(t, name) {
+  const directory = await mkdtemp(join(tmpdir(), 'engram-plugin-test-'))
+  t.after(() => rm(directory, { recursive: true, force: true }))
+  await mkdir(join(directory, '.engram'))
+  await writeFile(join(directory, '.engram', 'config.json'), JSON.stringify({ project_name: name }))
+  return directory
+}
+
+test('uses the official dependency and exposes a V2 definition', async () => {
   const pkg = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'))
-  assert.equal(pkg.type, 'module')
-  assert.equal(pkg.exports['.'].import, './index.js')
   assert.equal(pkg.dependencies['@opencode/plugin'], '2.0.26')
   assert.equal(pkg.scripts.postinstall, undefined)
+  assert.equal(plugin.id, 'engram.session-capture')
+  assert.equal(typeof plugin.setup, 'function')
+  assert.equal(privateText('x <private>secret</private>'), 'x [REDACTED]')
 })
 
-test('bare @opencode/plugin resolves inside this plugin directory', () => {
-  const resolved = fileURLToPath(import.meta.resolve('@opencode/plugin'))
-  assert.ok(resolved.startsWith(join(root, 'node_modules')))
-})
-
-test('plugin default export is a V2 definition that setup can run', async () => {
-  const mod = await import(pathToFileURL(join(root, 'index.js')).href)
-  assert.equal(mod.default.id, 'engram.session-capture')
-  assert.equal(typeof mod.default.setup, 'function')
-  assert.equal(typeof mod.privateText, 'function')
-
-  const hooks = []
-  const ctx = {
-    location: { directory: root, project: { name: 'engram-v2' } },
-    event: {
-      subscribe: async function* () {},
-    },
-    session: {
-      hook: async (name, fn) => {
-        hooks.push(['session', name, typeof fn])
-      },
-    },
-    tool: {
-      hook: async (name, fn) => {
-        hooks.push(['tool', name, typeof fn])
-      },
-    },
-  }
-  const cleanup = await mod.default.setup(ctx)
-  assert.equal(typeof cleanup, 'function')
-  cleanup()
-  assert.deepEqual(hooks, [
-    ['session', 'prompt', 'function'],
-    ['tool', 'execute.after', 'function'],
-  ])
-})
-
-test('plugin source uses V2 sessionEventRef and never reads info.id', async () => {
-  const source = await readFile(join(root, 'index.js'), 'utf8')
-  assert.match(source, /applySessionLifecycle/)
-  assert.doesNotMatch(source, /info\.id/)
-})
-
-describe('engram plugin V2 event wiring', { concurrency: 1 }, () => {
-test('disabled capture performs no hook registrations, event subscriptions or HTTP requests', async () => {
-  const mod = await import(pathToFileURL(join(root, 'index.js')).href)
-  const originalFetch = globalThis.fetch
-  const previous = process.env.ENGRAM_CAPTURE_DISABLED
-  globalThis.fetch = () => { throw new Error('unexpected HTTP') }
+test('opt-out and invalid port act before subscriptions, hooks, or requests', async () => {
+  const port = process.env.ENGRAM_PORT
+  const disabled = process.env.ENGRAM_CAPTURE_DISABLED
+  const poison = new Proxy({}, { get() { throw new Error('unexpected context access') } })
   try {
-    const poison = new Proxy({}, { get() { throw new Error('unexpected context access') } })
-    assert.equal(await mod.default.setup({ options: { enabled: false }, location: poison }), undefined)
+    assert.equal(await plugin.setup({ options: { enabled: false }, event: poison, session: poison, tool: poison }), undefined)
     process.env.ENGRAM_CAPTURE_DISABLED = '1'
-    assert.equal(await mod.default.setup({ options: {}, location: poison }), undefined)
+    assert.equal(await plugin.setup({ event: poison, session: poison, tool: poison }), undefined)
+    delete process.env.ENGRAM_CAPTURE_DISABLED
+    process.env.ENGRAM_PORT = '65536'
+    assert.equal(await plugin.setup({ event: poison, session: poison, tool: poison }), undefined)
   } finally {
-    globalThis.fetch = originalFetch
-    if (previous === undefined) delete process.env.ENGRAM_CAPTURE_DISABLED
-    else process.env.ENGRAM_CAPTURE_DISABLED = previous
+    if (port === undefined) delete process.env.ENGRAM_PORT
+    else process.env.ENGRAM_PORT = port
+    if (disabled === undefined) delete process.env.ENGRAM_CAPTURE_DISABLED
+    else process.env.ENGRAM_CAPTURE_DISABLED = disabled
   }
 })
-test('real V2 session.created events skip child prompts and child tools', async () => {
+
+test('captures current session identity, skips children and retries failed registration', async (t) => {
+  const a = await fixture(t, 'Fixture A')
+  const b = await fixture(t, 'Fixture B')
+  const sessions = new Map([
+    ['parent', { id: 'parent', location: { directory: a } }],
+    ['child', { id: 'child', parentID: 'parent', location: { directory: a } }],
+    ['retry', { id: 'retry', location: { directory: b } }],
+    ['mismatch', { id: 'other', location: { directory: a } }],
+  ])
+  const previousFetch = globalThis.fetch
+  const previousPort = process.env.ENGRAM_PORT
+  const previousDisabled = process.env.ENGRAM_CAPTURE_DISABLED
   const posts = []
-  const originalFetch = globalThis.fetch
+  let fail = false
+  let prompt, tool, cleanup
+  process.env.ENGRAM_PORT = '9001'
+  delete process.env.ENGRAM_CAPTURE_DISABLED
   globalThis.fetch = async (url, init) => {
-    posts.push({
-      url: String(url),
-      method: init?.method ?? 'GET',
-      body: init?.body ? JSON.parse(init.body) : null,
-    })
+    const post = { route: new URL(url).pathname, body: JSON.parse(init.body), port: new URL(url).port }
+    posts.push(post)
+    if (fail && post.route === '/sessions') return { ok: false }
     return { ok: true, json: async () => ({ ok: true }) }
   }
-
-  let promptFn
-  let toolFn
-  let eventsReady
-  const ready = new Promise((resolve) => { eventsReady = resolve })
-
   try {
-    const mod = await import(pathToFileURL(join(root, 'index.js')).href)
-    const ctx = {
-      location: { directory: root, project: { name: 'engram-v2' } },
-      event: {
-        subscribe: async function* ({ signal } = {}) {
-          yield {
-            type: 'session.created',
-            data: { sessionID: 'ses_root', slug: 'root', projectID: 'prj', location: { directory: root }, version: '1' },
-          }
-          yield {
-            type: 'session.created',
-            data: {
-              sessionID: 'ses_child',
-              parentID: 'ses_root',
-              slug: 'child',
-              projectID: 'prj',
-              location: { directory: root },
-              version: '1',
-            },
-          }
-          eventsReady()
-          await new Promise((resolve) => {
-            if (signal?.aborted) return resolve()
-            signal?.addEventListener('abort', () => resolve(), { once: true })
-          })
-        },
-      },
+    cleanup = await plugin.setup({
+      event: { subscribe: async function* () {} },
       session: {
-        hook: async (name, fn) => {
-          if (name === 'prompt') promptFn = fn
-        },
+        get: async ({ sessionID }) => sessions.get(sessionID),
+        hook: async (_, fn) => { prompt = fn },
       },
-      tool: {
-        hook: async (name, fn) => {
-          if (name === 'execute.after') toolFn = fn
-        },
-      },
+      tool: { hook: async (_, fn) => { tool = fn } },
+    })
+    await prompt({ sessionID: 'parent', prompt: { text: 'long prompt <private>hidden</private> retained' } })
+    await tool({ sessionID: 'parent', tool: 'subagent', status: 'ok', result: 'x'.repeat(60) })
+    const beforeSkipped = posts.length
+    for (const sessionID of ['child', 'missing', 'mismatch']) {
+      await prompt({ sessionID, prompt: { text: 'must not be captured for this session' } })
+      await tool({ sessionID, tool: 'subagent', status: 'ok', result: 'x'.repeat(60) })
     }
-
-    const cleanup = await mod.default.setup(ctx)
-    await ready
-
-    await promptFn({
-      sessionID: 'ses_child',
-      prompt: { text: 'child prompt long enough that it would otherwise be stored' },
-    })
-    await toolFn({
-      sessionID: 'ses_child',
-      tool: 'subagent',
-      status: 'ok',
-      result: 'x'.repeat(30) + 'child-tool-secret' + 'y'.repeat(30),
-    })
-    await promptFn({
-      sessionID: 'ses_root',
-      prompt: { text: 'parent prompt long enough to capture into engram' },
-    })
-
-    const promptPosts = posts.filter((post) => post.url.endsWith('/prompts'))
-    const sessionPosts = posts.filter((post) => post.url.endsWith('/sessions'))
-    const observationPosts = posts.filter((post) => post.url.endsWith('/observations/passive'))
-    assert.deepEqual(sessionPosts.map((post) => post.body.id), ['ses_root'])
-    assert.deepEqual(promptPosts.map((post) => post.body.session_id), ['ses_root'])
-    assert.equal(observationPosts.length, 0)
-    assert.equal(posts.some((post) => post.body?.session_id === 'ses_child' || post.body?.id === 'ses_child'), false)
-    cleanup()
+    await tool({ sessionID: 'parent', tool: 'mem_save', result: 'x'.repeat(60) })
+    assert.equal(posts.length, beforeSkipped)
+    sessions.set('parent', { id: 'parent', location: { directory: b } })
+    await prompt({ sessionID: 'parent', prompt: { text: 'moved session uses the new identity' } })
+    fail = true
+    await prompt({ sessionID: 'retry', prompt: { text: 'failed registration is not captured' } })
+    fail = false
+    await prompt({ sessionID: 'retry', prompt: { text: 'later registration is retried' } })
+    assert.deepEqual(posts.filter(p => p.route === '/prompts').map(p => [p.body.session_id, p.body.project]), [
+      ['parent', 'Fixture A'], ['parent', 'Fixture B'], ['retry', 'Fixture B'],
+    ])
+    assert.deepEqual(posts.filter(p => p.route === '/sessions').map(p => [p.body.id, p.body.project]), [
+      ['parent', 'Fixture A'], ['parent', 'Fixture B'], ['retry', 'Fixture B'], ['retry', 'Fixture B'],
+    ])
+    assert.equal(posts.find(p => p.route === '/observations/passive').body.project, 'Fixture A')
+    assert.equal(posts.some(p => JSON.stringify(p.body).includes('hidden')), false)
+    assert.equal(posts.every(p => p.port === '9001'), true)
   } finally {
-    globalThis.fetch = originalFetch
+    cleanup?.()
+    globalThis.fetch = previousFetch
+    if (previousPort === undefined) delete process.env.ENGRAM_PORT
+    else process.env.ENGRAM_PORT = previousPort
+    if (previousDisabled === undefined) delete process.env.ENGRAM_CAPTURE_DISABLED
+    else process.env.ENGRAM_CAPTURE_DISABLED = previousDisabled
   }
 })
 
-test('real V2 session.deleted uses data.sessionID not info.id', async () => {
+test('a child creation event excludes that session even when session lookup reports a parent', async (t) => {
+  const directory = await fixture(t, 'Fixture')
+  const previousFetch = globalThis.fetch
+  const previousPort = process.env.ENGRAM_PORT
+  const previousDisabled = process.env.ENGRAM_CAPTURE_DISABLED
   const posts = []
-  const originalFetch = globalThis.fetch
+  let signalReady, prompt, cleanup
+  const ready = new Promise(resolve => { signalReady = resolve })
+  delete process.env.ENGRAM_CAPTURE_DISABLED
+  delete process.env.ENGRAM_PORT
   globalThis.fetch = async (url, init) => {
-    posts.push({
-      url: String(url),
-      body: init?.body ? JSON.parse(init.body) : null,
-    })
+    posts.push({ route: new URL(url).pathname, body: JSON.parse(init.body) })
     return { ok: true, json: async () => ({ ok: true }) }
   }
-
-  let promptFn
-  let eventsReady
-  const ready = new Promise((resolve) => { eventsReady = resolve })
-
   try {
-    const mod = await import(pathToFileURL(join(root, 'index.js')).href)
-    const ctx = {
-      location: { directory: root, project: { name: 'engram-v2' } },
-      event: {
-        subscribe: async function* ({ signal } = {}) {
-          yield { type: 'session.created', data: { sessionID: 'ses_root' } }
-          yield { type: 'session.created', data: { sessionID: 'ses_child', parentID: 'ses_root' } }
-          yield { type: 'session.deleted', properties: { info: { id: 'ses_root' } }, data: { id: 'ses_root' } }
-          yield { type: 'session.deleted', data: { sessionID: 'ses_child' } }
-          eventsReady()
-          await new Promise((resolve) => {
-            if (signal?.aborted) return resolve()
-            signal?.addEventListener('abort', () => resolve(), { once: true })
-          })
-        },
-      },
+    cleanup = await plugin.setup({
+      event: { subscribe: async function* ({ signal }) {
+        yield { type: 'session.created', data: { sessionID: 'child', parentID: 'parent' } }
+        signalReady()
+        await new Promise(resolve => {
+          if (signal.aborted) resolve()
+          else signal.addEventListener('abort', resolve, { once: true })
+        })
+      } },
       session: {
-        hook: async (name, fn) => {
-          if (name === 'prompt') promptFn = fn
-        },
+        get: async ({ sessionID }) => ({ id: sessionID, location: { directory } }),
+        hook: async (_, fn) => { prompt = fn },
       },
       tool: { hook: async () => {} },
-    }
-
-    const cleanup = await mod.default.setup(ctx)
+    })
     await ready
-    await promptFn({
-      sessionID: 'ses_root',
-      prompt: { text: 'parent still captures after a decoy info.id delete' },
-    })
-    await promptFn({
-      sessionID: 'ses_child',
-      prompt: { text: 'deleted child must not be captured as a new parent' },
-    })
-
-    const promptPosts = posts.filter((post) => post.url.endsWith('/prompts'))
-    assert.deepEqual(promptPosts.map((post) => post.body.session_id), ['ses_root'])
-    cleanup()
+    await prompt({ sessionID: 'child', prompt: { text: 'child prompt should not be stored' } })
+    await prompt({ sessionID: 'parent', prompt: { text: 'parent prompt should be captured' } })
+    assert.deepEqual(posts.map(p => [p.route, p.body.id ?? p.body.session_id]), [
+      ['/sessions', 'parent'], ['/prompts', 'parent'],
+    ])
   } finally {
-    globalThis.fetch = originalFetch
+    cleanup?.()
+    globalThis.fetch = previousFetch
+    if (previousPort === undefined) delete process.env.ENGRAM_PORT
+    else process.env.ENGRAM_PORT = previousPort
+    if (previousDisabled === undefined) delete process.env.ENGRAM_CAPTURE_DISABLED
+    else process.env.ENGRAM_CAPTURE_DISABLED = previousDisabled
   }
-})
 })

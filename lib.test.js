@@ -1,5 +1,8 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { mkdtemp, mkdir, writeFile, rm, realpath, symlink } from 'node:fs/promises'
+import { join, parse } from 'node:path'
+import { tmpdir, homedir } from 'node:os'
 import {
   applySessionLifecycle,
   engramBase,
@@ -7,6 +10,8 @@ import {
   promptCapture,
   request,
   resolveProject,
+  resolveProjectIdentity,
+  configuredProjectName,
   sessionEventRef,
   toolAfterCapture,
 } from './lib.js'
@@ -32,15 +37,116 @@ test('privateText redacts unclosed tags and fails closed on malformed markup', (
   assert.doesNotMatch(privateText('keep <private>api-key-should-not-leak'), /api-key-should-not-leak/)
 })
 
-test('resolveProject prefers location name then directory leaf', () => {
-  assert.equal(resolveProject({ directory: 'C:\\tmp\\Demo', project: { name: 'demo' } }), 'demo')
-  assert.equal(resolveProject({ directory: 'C:\\fixtures\\ExampleProject' }), 'exampleproject')
-  assert.equal(resolveProject({}), 'unknown')
+async function fixture(t) {
+  const root = await mkdtemp(join(tmpdir(), 'engram-test-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  return root
+}
+
+async function config(directory, project) {
+  await mkdir(join(directory, '.engram'), { recursive: true })
+  await writeFile(join(directory, '.engram', 'config.json'), JSON.stringify({ project_name: project }))
+}
+
+// Minimal Git metadata avoids commits, global Git settings, and fixture repositories with real data.
+async function gitFixture(directory) {
+  const git = join(directory, '.git')
+  await mkdir(join(git, 'objects'), { recursive: true })
+  await mkdir(join(git, 'refs'), { recursive: true })
+  await writeFile(join(git, 'HEAD'), 'ref: refs/heads/main\n')
+  await writeFile(join(git, 'config'), '[core]\n\trepositoryformatversion = 0\n\tbare = false\n')
+  return git
+}
+
+test('project identity rejects missing, relative, root and home directories', async () => {
+  for (const directory of [undefined, 'relative', homedir(), parse(homedir()).root]) {
+    await assert.rejects(resolveProject({ directory }), /Ambiguous/)
+  }
+})
+
+test('configured identity preserves label and canonicalizes location; invalid config fails closed', async (t) => {
+  const root = await fixture(t)
+  const actual = join(root, 'actual ñ spaces')
+  const alias = join(root, 'alias')
+  await mkdir(actual)
+  await config(actual, '  Mixed__Case ñ  ')
+  await symlink(actual, alias, process.platform === 'win32' ? 'junction' : 'dir')
+  assert.deepEqual(await resolveProjectIdentity({ directory: alias, project: { name: 'wrong' } }), {
+    project: 'Mixed__Case ñ', directory: await realpath(actual),
+  })
+  for (const value of [null, 1, '', 'a/b', 'a\\b', 'a\nline']) {
+    assert.throws(() => configuredProjectName(value), /Invalid/)
+    await config(actual, value)
+    await assert.rejects(resolveProject({ directory: actual }), /Invalid/)
+  }
+  await writeFile(join(actual, '.engram', 'config.json'), '{fixture-sentinel')
+  await assert.rejects(resolveProject({ directory: actual }), error => error.message === 'Invalid Engram project configuration')
+})
+
+test('checkout-scoped nearest config wins, including invalid nearer config', async (t) => {
+  const root = await fixture(t)
+  const repo = join(root, 'Repo Name')
+  const nested = join(repo, 'packages', 'nested')
+  await mkdir(nested, { recursive: true })
+  await gitFixture(repo)
+  await config(root, 'OUTSIDE')
+  assert.equal(await resolveProject({ directory: nested }), 'repo name')
+  await config(repo, 'ROOT')
+  assert.equal(await resolveProject({ directory: nested }), 'ROOT')
+  await config(join(repo, 'packages'), 'NEAREST')
+  assert.equal(await resolveProject({ directory: nested }), 'NEAREST')
+  await config(nested, 'bad/name')
+  await assert.rejects(resolveProject({ directory: nested }), /Invalid/)
+})
+
+test('non-Git directories ignore parent config and repository containers are ambiguous', async (t) => {
+  const root = await fixture(t)
+  await config(root, 'OUTSIDE')
+  const plain = join(root, 'Plain Name')
+  await mkdir(plain)
+  assert.equal(await resolveProject({ directory: plain }), 'plain name')
+  await gitFixture(join(plain, 'child'))
+  await assert.rejects(resolveProject({ directory: plain }), /Ambiguous/)
+})
+
+test('linked checkout uses shared config only if its checkout has none', async (t) => {
+  const root = await fixture(t)
+  const primary = join(root, 'primary')
+  const linked = join(root, 'linked ñ')
+  await mkdir(primary); await mkdir(linked)
+  const common = await gitFixture(primary)
+  const metadata = join(common, 'worktrees', 'linked')
+  await mkdir(metadata, { recursive: true })
+  await writeFile(join(metadata, 'HEAD'), 'ref: refs/heads/linked\n')
+  await writeFile(join(metadata, 'commondir'), '../..\n')
+  await writeFile(join(metadata, 'gitdir'), `${join(linked, '.git')}\n`)
+  await writeFile(join(linked, '.git'), `gitdir: ${metadata}\n`)
+  await config(primary, 'Primary')
+  assert.equal(await resolveProject({ directory: linked }), 'Primary')
+  await config(linked, 'Linked')
+  assert.equal(await resolveProject({ directory: linked }), 'Linked')
+  await config(linked, '../invalid')
+  await assert.rejects(resolveProject({ directory: linked }), /Invalid/)
+})
+
+test('explicit config works with broken checkout metadata; absent config fails closed', async (t) => {
+  const root = await fixture(t)
+  await writeFile(join(root, '.git'), 'gitdir: missing\n')
+  await config(root, 'Explicit')
+  assert.equal(await resolveProject({ directory: root }), 'Explicit')
+  await rm(join(root, '.engram'), { recursive: true })
+  await assert.rejects(resolveProject({ directory: root }))
 })
 
 test('engramBase uses loopback and ENGRAM_PORT override', () => {
   assert.equal(engramBase({}), 'http://127.0.0.1:7437')
   assert.equal(engramBase({ ENGRAM_PORT: '9001' }), 'http://127.0.0.1:9001')
+  assert.equal(engramBase({ ENGRAM_PORT: '  ' }), 'http://127.0.0.1:7437')
+  assert.equal(engramBase({ ENGRAM_PORT: ' 1 ' }), 'http://127.0.0.1:1')
+  assert.equal(engramBase({ ENGRAM_PORT: '65535' }), 'http://127.0.0.1:65535')
+  for (const port of ['0', '-1', '65536', '1.5', '1e3', '0x10', 'NaN', 'http://example.invalid']) {
+    assert.throws(() => engramBase({ ENGRAM_PORT: port }), /Invalid local Engram port/)
+  }
 })
 
 test('promptCapture skips children, short text, and missing ids', () => {

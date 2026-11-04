@@ -1,3 +1,11 @@
+import { lstat, readFile, realpath, readdir } from 'node:fs/promises'
+import { basename, dirname, isAbsolute, join, relative } from 'node:path'
+import { homedir } from 'node:os'
+import { execFile } from 'node:child_process'
+import { promisify } from 'node:util'
+
+const runFile = promisify(execFile)
+
 export function privateText(text) {
   const raw = String(text ?? '')
   if (!raw) return ''
@@ -59,15 +67,100 @@ export function applySessionLifecycle(state, event) {
   return { kind: 'ignore' }
 }
 
-export function resolveProject(location) {
-  const directory = location?.directory ?? ''
-  return location?.project?.name
-    ?? directory.split(/[\\/]/).filter(Boolean).at(-1)?.toLowerCase()
-    ?? 'unknown'
+export function configuredProjectName(value) {
+  if (typeof value !== 'string' || !value.trim() || /[\\/\x00-\x1f\x7f]/.test(value.trim())) {
+    throw new Error('Invalid Engram project configuration')
+  }
+  return value.trim()
+}
+
+async function exists(path) {
+  try { await lstat(path); return true } catch (error) {
+    if (error.code === 'ENOENT') return false
+    throw error
+  }
+}
+
+function contains(root, directory) {
+  const part = relative(root, directory)
+  return !isAbsolute(part) && part !== '..' && !part.startsWith('..\\') && !part.startsWith('../')
+}
+
+async function configAt(directory) {
+  const path = join(directory, '.engram', 'config.json')
+  if (!await exists(path)) return null
+  try {
+    const value = JSON.parse(await readFile(path, 'utf8'))
+    return configuredProjectName(value?.project_name)
+  } catch {
+    throw new Error('Invalid Engram project configuration')
+  }
+}
+
+async function gitPath(directory, argument) {
+  const { stdout } = await runFile('git', ['-C', directory, 'rev-parse', '--path-format=absolute', argument], {
+    timeout: 2000, windowsHide: true, maxBuffer: 65536,
+  })
+  return realpath(stdout.trim())
+}
+
+export async function resolveProjectIdentity(location) {
+  const input = location?.directory
+  if (typeof input !== 'string' || !isAbsolute(input)) throw new Error('Ambiguous session directory')
+  const directory = await realpath(input)
+  const home = await realpath(homedir())
+  if (directory === home || dirname(directory) === directory) throw new Error('Ambiguous session directory')
+
+  const configured = await configAt(directory)
+  if (configured !== null) return { project: configured, directory }
+
+  let checkout = null
+  let cursor = directory
+  while (cursor !== home && dirname(cursor) !== cursor) {
+    if (await exists(join(cursor, '.git'))) {
+      checkout = await gitPath(directory, '--show-toplevel')
+      if (!contains(checkout, directory)) throw new Error('Ambiguous session directory')
+      break
+    }
+    cursor = dirname(cursor)
+  }
+  cursor = directory
+  while (true) {
+    const project = await configAt(cursor)
+    if (project !== null) return { project, directory }
+    if (!checkout || cursor === checkout) break
+    cursor = dirname(cursor)
+  }
+  if (checkout) {
+    const common = await gitPath(directory, '--git-common-dir')
+    if (basename(common) === '.git') {
+      const primary = dirname(common)
+      if (primary !== checkout && primary !== home) {
+        const project = await configAt(primary)
+        if (project !== null) return { project, directory }
+      }
+    }
+  } else {
+    for (const entry of await readdir(directory, { withFileTypes: true })) {
+      if (entry.isDirectory() && !entry.name.startsWith('.') && await exists(join(directory, entry.name, '.git'))) {
+        throw new Error('Ambiguous session directory')
+      }
+    }
+  }
+  return { project: configuredProjectName(basename(checkout ?? directory).toLowerCase()), directory }
+}
+
+export async function resolveProject(location) {
+  return (await resolveProjectIdentity(location)).project
 }
 
 export function engramBase(env = process.env) {
-  const port = Number(env.ENGRAM_PORT ?? 7437)
+  const raw = env.ENGRAM_PORT
+  const text = raw == null ? '' : String(raw).trim()
+  const port = text === '' ? 7437 : Number(text)
+  if ((text !== '' && !/^\d+$/.test(text)) || !Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error('Invalid local Engram port')
+  }
   return `http://127.0.0.1:${port}`
 }
 
