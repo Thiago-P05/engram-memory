@@ -25,20 +25,14 @@ test('uses the official dependency and exposes a V2 definition', async () => {
   assert.equal(privateText('x <private>secret</private>'), 'x [REDACTED]')
 })
 
-test('opt-out and invalid port act before subscriptions, hooks, or requests', async () => {
-  const port = process.env.ENGRAM_PORT
+test('opt-out acts before subscriptions, hooks, or requests', async () => {
   const disabled = process.env.ENGRAM_CAPTURE_DISABLED
   const poison = new Proxy({}, { get() { throw new Error('unexpected context access') } })
   try {
     assert.equal(await plugin.setup({ options: { enabled: false }, event: poison, session: poison, tool: poison }), undefined)
     process.env.ENGRAM_CAPTURE_DISABLED = '1'
     assert.equal(await plugin.setup({ event: poison, session: poison, tool: poison }), undefined)
-    delete process.env.ENGRAM_CAPTURE_DISABLED
-    process.env.ENGRAM_PORT = '65536'
-    assert.equal(await plugin.setup({ event: poison, session: poison, tool: poison }), undefined)
   } finally {
-    if (port === undefined) delete process.env.ENGRAM_PORT
-    else process.env.ENGRAM_PORT = port
     if (disabled === undefined) delete process.env.ENGRAM_CAPTURE_DISABLED
     else process.env.ENGRAM_CAPTURE_DISABLED = disabled
   }
@@ -56,9 +50,18 @@ test('captures current session identity, skips children and retries failed regis
   const previousFetch = globalThis.fetch
   const previousPort = process.env.ENGRAM_PORT
   const previousDisabled = process.env.ENGRAM_CAPTURE_DISABLED
+  const previousProfile = process.env.USERPROFILE
+  const previousHome = process.env.HOME
   const posts = []
   let fail = false
   let prompt, tool, cleanup
+  const home = await mkdtemp(join(tmpdir(), 'engram-home-'))
+  t.after(() => rm(home, { recursive: true, force: true }))
+  await mkdir(join(home, '.config', 'engram'), { recursive: true })
+  await writeFile(join(home, '.config', 'engram', 'client.json'),
+    JSON.stringify({ mode: 'remote', port: 9001, remote_port: 7437 }))
+  process.env.USERPROFILE = home
+  process.env.HOME = home
   process.env.ENGRAM_PORT = '9001'
   delete process.env.ENGRAM_CAPTURE_DISABLED
   globalThis.fetch = async (url, init) => {
@@ -107,6 +110,10 @@ test('captures current session identity, skips children and retries failed regis
     else process.env.ENGRAM_PORT = previousPort
     if (previousDisabled === undefined) delete process.env.ENGRAM_CAPTURE_DISABLED
     else process.env.ENGRAM_CAPTURE_DISABLED = previousDisabled
+    if (previousProfile === undefined) delete process.env.USERPROFILE
+    else process.env.USERPROFILE = previousProfile
+    if (previousHome === undefined) delete process.env.HOME
+    else process.env.HOME = previousHome
   }
 })
 
@@ -115,9 +122,18 @@ test('a child creation event excludes that session even when session lookup repo
   const previousFetch = globalThis.fetch
   const previousPort = process.env.ENGRAM_PORT
   const previousDisabled = process.env.ENGRAM_CAPTURE_DISABLED
+  const previousProfile = process.env.USERPROFILE
+  const previousHome = process.env.HOME
   const posts = []
   let signalReady, prompt, cleanup
   const ready = new Promise(resolve => { signalReady = resolve })
+  const home = await mkdtemp(join(tmpdir(), 'engram-home-'))
+  t.after(() => rm(home, { recursive: true, force: true }))
+  await mkdir(join(home, '.config', 'engram'), { recursive: true })
+  await writeFile(join(home, '.config', 'engram', 'client.json'),
+    JSON.stringify({ mode: 'remote', port: 7437, remote_port: 7437 }))
+  process.env.USERPROFILE = home
+  process.env.HOME = home
   delete process.env.ENGRAM_CAPTURE_DISABLED
   delete process.env.ENGRAM_PORT
   globalThis.fetch = async (url, init) => {
@@ -153,5 +169,9 @@ test('a child creation event excludes that session even when session lookup repo
     else process.env.ENGRAM_PORT = previousPort
     if (previousDisabled === undefined) delete process.env.ENGRAM_CAPTURE_DISABLED
     else process.env.ENGRAM_CAPTURE_DISABLED = previousDisabled
+    if (previousProfile === undefined) delete process.env.USERPROFILE
+    else process.env.USERPROFILE = previousProfile
+    if (previousHome === undefined) delete process.env.HOME
+    else process.env.HOME = previousHome
   }
 })

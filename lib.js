@@ -68,6 +68,7 @@ export function applySessionLifecycle(state, event) {
 }
 
 export function configuredProjectName(value) {
+  // v3.4.0 structural validation; preserve the operator's configured label.
   if (typeof value !== 'string' || !value.trim() || /[\\/\x00-\x1f\x7f]/.test(value.trim())) {
     throw new Error('Invalid Engram project configuration')
   }
@@ -93,6 +94,7 @@ async function configAt(directory) {
     const value = JSON.parse(await readFile(path, 'utf8'))
     return configuredProjectName(value?.project_name)
   } catch {
+    // Never echo config contents or filesystem errors into logs.
     throw new Error('Invalid Engram project configuration')
   }
 }
@@ -110,10 +112,12 @@ export async function resolveProjectIdentity(location) {
   const directory = await realpath(input)
   const home = await realpath(homedir())
   if (directory === home || dirname(directory) === directory) throw new Error('Ambiguous session directory')
-
+  // Match the transport: an explicit cwd identity does not depend on healthy
+  // Git metadata (old linked checkout metadata can reference removed paths).
   const configured = await configAt(directory)
   if (configured !== null) return { project: configured, directory }
 
+  // Detect checkout metadata without initializing bindings or running a shell.
   let checkout = null
   let cursor = directory
   while (cursor !== home && dirname(cursor) !== cursor) {
@@ -124,6 +128,7 @@ export async function resolveProjectIdentity(location) {
     }
     cursor = dirname(cursor)
   }
+  // Match CLI config scope: Git ancestors within this checkout, otherwise cwd only.
   cursor = directory
   while (true) {
     const project = await configAt(cursor)
@@ -132,6 +137,8 @@ export async function resolveProjectIdentity(location) {
     cursor = dirname(cursor)
   }
   if (checkout) {
+    // A linked checkout may have no copied config. Its shared primary config
+    // is authoritative only after the entire local checkout had no config.
     const common = await gitPath(directory, '--git-common-dir')
     if (basename(common) === '.git') {
       const primary = dirname(common)
@@ -141,27 +148,61 @@ export async function resolveProjectIdentity(location) {
       }
     }
   } else {
+    // Do not label a container of repositories as a project by its basename.
     for (const entry of await readdir(directory, { withFileTypes: true })) {
       if (entry.isDirectory() && !entry.name.startsWith('.') && await exists(join(directory, entry.name, '.git'))) {
         throw new Error('Ambiguous session directory')
       }
     }
   }
-  return { project: configuredProjectName(basename(checkout ?? directory).toLowerCase()), directory }
+  const leaf = basename(checkout ?? directory).toLowerCase()
+  return { project: configuredProjectName(leaf), directory }
 }
 
 export async function resolveProject(location) {
   return (await resolveProjectIdentity(location)).project
 }
 
-export function engramBase(env = process.env) {
-  const raw = env.ENGRAM_PORT
-  const text = raw == null ? '' : String(raw).trim()
-  const port = text === '' ? 7437 : Number(text)
-  if ((text !== '' && !/^\d+$/.test(text)) || !Number.isInteger(port) || port < 1 || port > 65535) {
+function localPort(value) {
+  const text = typeof value === 'string' ? value.trim() : value
+  if ((typeof text !== 'number' && (typeof text !== 'string' || !/^\d+$/.test(text))) ||
+      !Number.isInteger(Number(text)) || Number(text) < 1 || Number(text) > 65535) {
     throw new Error('Invalid local Engram port')
   }
-  return `http://127.0.0.1:${port}`
+  return Number(text)
+}
+
+export async function engramBase(env = process.env, clientPath = join(homedir(), '.config', 'engram', 'client.json')) {
+  // A remote-mode client pins global capture to its loopback tunnel, including
+  // on missing/corrupt config. Explicit fixture paths keep local compatibility.
+  const managed = clientPath === join(homedir(), '.config', 'engram', 'client.json')
+  const override = env.ENGRAM_PORT !== undefined && String(env.ENGRAM_PORT).trim() !== ''
+  let contents
+  try {
+    contents = await readFile(clientPath, 'utf8')
+  } catch (error) {
+    if (error.code === 'ENOENT' && !managed) {
+      return `http://127.0.0.1:${override ? localPort(env.ENGRAM_PORT) : 7437}`
+    }
+    throw new Error('Cannot read local Engram client configuration')
+  }
+  try {
+    const config = JSON.parse(contents)
+    if (managed || config?.mode === 'remote') {
+      // A remote configuration pins exactly one loopback tunnel port; never a
+      // local daemon and never an arbitrary override.
+      if (config?.mode !== 'remote' || !Number.isInteger(config.port) ||
+          config.port < 1 || config.port > 65535 ||
+          (override && localPort(env.ENGRAM_PORT) !== config.port)) {
+        throw new Error('Remote capture configuration required')
+      }
+      return `http://127.0.0.1:${config.port}`
+    }
+    const port = localPort(config?.port)
+    return `http://127.0.0.1:${override ? localPort(env.ENGRAM_PORT) : port}`
+  } catch {
+    throw new Error('Invalid local Engram client configuration')
+  }
 }
 
 export async function request(base, route, body, fetchImpl = fetch) {

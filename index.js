@@ -16,12 +16,6 @@ export default Plugin.define({
   async setup(ctx) {
     // Opt out before registering hooks, subscribing, or sending any metadata.
     if (ctx.options?.enabled === false || process.env.ENGRAM_CAPTURE_DISABLED === '1') return
-    try {
-      engramBase()
-    } catch {
-      // An invalid destination disables capture rather than selecting a fallback.
-      return
-    }
     const known = new Set()
     const identities = new Map()
     const children = new Set()
@@ -39,7 +33,7 @@ export default Plugin.define({
         }
         const identity = await resolveProjectIdentity(session.location)
         // Refresh the destination for each operation, not just at module load.
-        const base = engramBase()
+        const base = await engramBase()
         const previous = identities.get(id)
         if (known.has(id) && previous?.project === identity.project && previous?.directory === identity.directory && previous?.base === base) return { ...identity, base }
         // Reassert current identity even for known IDs after a session move.

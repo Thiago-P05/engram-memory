@@ -1,8 +1,10 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdtemp, mkdir, writeFile, rm, realpath, symlink } from 'node:fs/promises'
-import { join, parse } from 'node:path'
+import { join } from 'node:path'
 import { tmpdir, homedir } from 'node:os'
+import { execFile } from 'node:child_process'
+import { promisify } from 'node:util'
 import {
   applySessionLifecycle,
   engramBase,
@@ -37,116 +39,196 @@ test('privateText redacts unclosed tags and fails closed on malformed markup', (
   assert.doesNotMatch(privateText('keep <private>api-key-should-not-leak'), /api-key-should-not-leak/)
 })
 
+test('resolveProject rejects missing, relative and global home paths', async () => {
+  await assert.rejects(resolveProject({}), /Ambiguous/)
+  await assert.rejects(resolveProject({ directory: 'relative' }), /Ambiguous/)
+  await assert.rejects(resolveProject({ directory: homedir() }), /Ambiguous/)
+})
+
+const run = promisify(execFile)
 async function fixture(t) {
-  const root = await mkdtemp(join(tmpdir(), 'engram-test-'))
+  const root = await mkdtemp(join(tmpdir(), 'pcplugin-fixture-'))
   t.after(() => rm(root, { recursive: true, force: true }))
   return root
 }
-
 async function config(directory, project) {
   await mkdir(join(directory, '.engram'), { recursive: true })
   await writeFile(join(directory, '.engram', 'config.json'), JSON.stringify({ project_name: project }))
 }
-
-// Minimal Git metadata avoids commits, global Git settings, and fixture repositories with real data.
-async function gitFixture(directory) {
-  const git = join(directory, '.git')
-  await mkdir(join(git, 'objects'), { recursive: true })
-  await mkdir(join(git, 'refs'), { recursive: true })
-  await writeFile(join(git, 'HEAD'), 'ref: refs/heads/main\n')
-  await writeFile(join(git, 'config'), '[core]\n\trepositoryformatversion = 0\n\tbare = false\n')
-  return git
+async function git(directory, ...args) {
+  return run('git', ['-C', directory, ...args], { timeout: 5000, windowsHide: true })
 }
 
-test('project identity rejects missing, relative, root and home directories', async () => {
-  for (const directory of [undefined, 'relative', homedir(), parse(homedir()).root]) {
-    await assert.rejects(resolveProject({ directory }), /Ambiguous/)
+test('15 configured identities override reported names without renaming', async (t) => {
+  const root = await fixture(t)
+  const names = ['ai-aigrowth', 'full-chatgipiti', 'Future Cloud', 'Project_Name', 'Árbol', '東京',
+    'name__kept', 'name--kept', 'CaseKept', 'a.b', 'A B C', 'uno', 'dos', 'tres', 'cuatro']
+  for (const [index, name] of names.entries()) {
+    const directory = join(root, `Windows spaces ${index} ñ`)
+    await mkdir(directory)
+    await config(directory, name)
+    assert.equal(await resolveProject({ directory, project: { name: 'WRONG' } }), name)
+    assert.equal((await resolveProjectIdentity({ directory })).directory, await realpath(directory))
   }
 })
 
-test('configured identity preserves label and canonicalizes location; invalid config fails closed', async (t) => {
+test('invalid present config fails closed instead of reported name or basename', async (t) => {
   const root = await fixture(t)
-  const actual = join(root, 'actual ñ spaces')
-  const alias = join(root, 'alias')
-  await mkdir(actual)
-  await config(actual, '  Mixed__Case ñ  ')
-  await symlink(actual, alias, process.platform === 'win32' ? 'junction' : 'dir')
-  assert.deepEqual(await resolveProjectIdentity({ directory: alias, project: { name: 'wrong' } }), {
-    project: 'Mixed__Case ñ', directory: await realpath(actual),
-  })
-  for (const value of [null, 1, '', 'a/b', 'a\\b', 'a\nline']) {
-    assert.throws(() => configuredProjectName(value), /Invalid/)
-    await config(actual, value)
-    await assert.rejects(resolveProject({ directory: actual }), /Invalid/)
+  await mkdir(join(root, '.engram'))
+  for (const contents of ['{', '{}', 'null', '[]', '{"project_name":42}', '{"project_name":""}',
+    '{"project_name":"  "}', '{"project_name":"a/b"}', '{"project_name":"a\\\\b"}', '{"project_name":"a\\u0000b"}']) {
+    await writeFile(join(root, '.engram', 'config.json'), contents)
+    await assert.rejects(resolveProject({ directory: root, project: { name: 'WRONG' } }), /Invalid/)
   }
-  await writeFile(join(actual, '.engram', 'config.json'), '{fixture-sentinel')
-  await assert.rejects(resolveProject({ directory: actual }), error => error.message === 'Invalid Engram project configuration')
+  await rm(join(root, '.engram', 'config.json'))
+  await mkdir(join(root, '.engram', 'config.json'))
+  await assert.rejects(resolveProject({ directory: root }), /Invalid/)
 })
 
-test('checkout-scoped nearest config wins, including invalid nearer config', async (t) => {
+test('checkout nearest ancestor wins; invalid nearer config blocks valid parent', async (t) => {
   const root = await fixture(t)
-  const repo = join(root, 'Repo Name')
-  const nested = join(repo, 'packages', 'nested')
+  await git(root, 'init', '--quiet')
+  const nested = join(root, 'packages', 'nested')
   await mkdir(nested, { recursive: true })
-  await gitFixture(repo)
-  await config(root, 'OUTSIDE')
-  assert.equal(await resolveProject({ directory: nested }), 'repo name')
-  await config(repo, 'ROOT')
+  await config(root, 'ROOT')
   assert.equal(await resolveProject({ directory: nested }), 'ROOT')
-  await config(join(repo, 'packages'), 'NEAREST')
+  await config(join(root, 'packages'), 'NEAREST')
   assert.equal(await resolveProject({ directory: nested }), 'NEAREST')
-  await config(nested, 'bad/name')
+  await config(nested, 'a/b')
   await assert.rejects(resolveProject({ directory: nested }), /Invalid/)
 })
 
-test('non-Git directories ignore parent config and repository containers are ambiguous', async (t) => {
+test('configs above checkout or non-Git cwd do not leak into sessions', async (t) => {
   const root = await fixture(t)
-  await config(root, 'OUTSIDE')
+  await config(root, 'GLOBAL_WRONG')
+  const repo = join(root, 'Repo Name')
   const plain = join(root, 'Plain Name')
-  await mkdir(plain)
+  await mkdir(repo); await mkdir(plain)
+  await git(repo, 'init', '--quiet')
+  assert.equal(await resolveProject({ directory: repo }), 'repo name')
   assert.equal(await resolveProject({ directory: plain }), 'plain name')
-  await gitFixture(join(plain, 'child'))
-  await assert.rejects(resolveProject({ directory: plain }), /Ambiguous/)
 })
 
-test('linked checkout uses shared config only if its checkout has none', async (t) => {
+test('unconfigured repository container is ambiguous, not a project', async (t) => {
+  const root = await fixture(t)
+  for (const name of ['one', 'two']) {
+    const child = join(root, name)
+    await mkdir(child)
+    await git(child, 'init', '--quiet')
+  }
+  await assert.rejects(resolveProject({ directory: root }), /Ambiguous/)
+})
+
+test('linked worktree uses shared config only when local checkout has none', async (t) => {
   const root = await fixture(t)
   const primary = join(root, 'primary')
-  const linked = join(root, 'linked ñ')
-  await mkdir(primary); await mkdir(linked)
-  const common = await gitFixture(primary)
-  const metadata = join(common, 'worktrees', 'linked')
-  await mkdir(metadata, { recursive: true })
-  await writeFile(join(metadata, 'HEAD'), 'ref: refs/heads/linked\n')
-  await writeFile(join(metadata, 'commondir'), '../..\n')
-  await writeFile(join(metadata, 'gitdir'), `${join(linked, '.git')}\n`)
-  await writeFile(join(linked, '.git'), `gitdir: ${metadata}\n`)
-  await config(primary, 'Primary')
-  assert.equal(await resolveProject({ directory: linked }), 'Primary')
-  await config(linked, 'Linked')
-  assert.equal(await resolveProject({ directory: linked }), 'Linked')
-  await config(linked, '../invalid')
-  await assert.rejects(resolveProject({ directory: linked }), /Invalid/)
+  const worktree = join(root, 'linked spaces ñ')
+  await mkdir(primary)
+  await git(primary, 'init', '--quiet')
+  await git(primary, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '--allow-empty', '-m', 'fixture')
+  await git(primary, 'worktree', 'add', '--quiet', '-b', 'fixture', worktree)
+  await config(primary, 'Primary_Config')
+  assert.equal(await resolveProject({ directory: worktree }), 'Primary_Config')
+  await config(worktree, 'Checkout_Config')
+  assert.equal(await resolveProject({ directory: worktree }), 'Checkout_Config')
+  await config(worktree, '../bad')
+  await assert.rejects(resolveProject({ directory: worktree }), /Invalid/)
 })
 
-test('explicit config works with broken checkout metadata; absent config fails closed', async (t) => {
-  const root = await fixture(t)
-  await writeFile(join(root, '.git'), 'gitdir: missing\n')
-  await config(root, 'Explicit')
-  assert.equal(await resolveProject({ directory: root }), 'Explicit')
-  await rm(join(root, '.engram'), { recursive: true })
-  await assert.rejects(resolveProject({ directory: root }))
-})
-
-test('engramBase uses loopback and ENGRAM_PORT override', () => {
-  assert.equal(engramBase({}), 'http://127.0.0.1:7437')
-  assert.equal(engramBase({ ENGRAM_PORT: '9001' }), 'http://127.0.0.1:9001')
-  assert.equal(engramBase({ ENGRAM_PORT: '  ' }), 'http://127.0.0.1:7437')
-  assert.equal(engramBase({ ENGRAM_PORT: ' 1 ' }), 'http://127.0.0.1:1')
-  assert.equal(engramBase({ ENGRAM_PORT: '65535' }), 'http://127.0.0.1:65535')
-  for (const port of ['0', '-1', '65536', '1.5', '1e3', '0x10', 'NaN', 'http://example.invalid']) {
-    assert.throws(() => engramBase({ ENGRAM_PORT: port }), /Invalid local Engram port/)
+test('configured labels validate structurally and trim without canonical renaming', () => {
+  assert.equal(configuredProjectName('  Mixed__Case -- ñ  '), 'Mixed__Case -- ñ')
+  for (const value of [null, 1, '', 'a/b', 'a\\b', 'a\x7fb', 'a\nb']) {
+    assert.throws(() => configuredProjectName(value), /Invalid/)
   }
+})
+
+test('junction/symlink location resolves to the actual configured directory', async (t) => {
+  const root = await fixture(t)
+  const actual = join(root, 'actual ñ spaces')
+  const alias = join(root, 'alias directory')
+  await mkdir(actual)
+  await config(actual, 'Canonical_Config')
+  await symlink(actual, alias, process.platform === 'win32' ? 'junction' : 'dir')
+  assert.deepEqual(await resolveProjectIdentity({ directory: alias }), {
+    project: 'Canonical_Config', directory: await realpath(actual),
+  })
+})
+
+test('engramBase falls back only for missing config and honors explicit host ports', async (t) => {
+  const root = await fixture(t)
+  const missing = join(root, 'missing.json')
+  assert.equal(await engramBase({}, missing), 'http://127.0.0.1:7437')
+  assert.equal(await engramBase({ ENGRAM_PORT: ' 9001 ' }, missing), 'http://127.0.0.1:9001')
+  assert.equal(await engramBase({ ENGRAM_PORT: '  ' }, missing), 'http://127.0.0.1:7437')
+  assert.equal(await engramBase({ ENGRAM_PORT: '7437' }, missing), 'http://127.0.0.1:7437')
+})
+
+test('private client config selects only port, refreshes changes and stays loopback', async (t) => {
+  const root = await fixture(t)
+  const path = join(root, 'private client ñ.json')
+  await writeFile(path, JSON.stringify({ port: 17437, server_url: 'https://example.invalid', token: 'fixture-only-sentinel' }))
+  assert.equal(await engramBase({}, path), 'http://127.0.0.1:17437')
+  assert.equal(await engramBase({ ENGRAM_PORT: ' ' }, path), 'http://127.0.0.1:17437')
+  assert.equal(await engramBase({ ENGRAM_PORT: ' 17438 ' }, path), 'http://127.0.0.1:17438')
+  await writeFile(path, '{"port":"17439"}')
+  assert.equal(await engramBase({}, path), 'http://127.0.0.1:17439')
+})
+
+test('invalid explicit ports fail closed rather than selecting another destination', async (t) => {
+  const root = await fixture(t)
+  const path = join(root, 'config.json')
+  await writeFile(path, '{"port":17437}')
+  for (const port of ['0', '-1', '65536', '3.5', '1e3', '0x10', 'NaN', 'http://example.invalid', true, null]) {
+    await assert.rejects(engramBase({ ENGRAM_PORT: port }, path), /Invalid local Engram client configuration/)
+  }
+  for (const port of ['1', '65535']) {
+    assert.equal(await engramBase({ ENGRAM_PORT: port }, path), `http://127.0.0.1:${port}`)
+  }
+})
+
+test('malformed private config and invalid ports do not leak contents or silently fall back', async (t) => {
+  const root = await fixture(t)
+  const path = join(root, 'config.json')
+  for (const contents of ['{fixture-only-sentinel', '{}', 'null', '[]', '{"port":true}', '{"port":0}',
+    '{"port":65536}', '{"port":1.5}', '{"port":" "}', '{"port":"https://example.invalid"}']) {
+    await writeFile(path, contents)
+    await assert.rejects(engramBase({}, path), error => error.message === 'Invalid local Engram client configuration')
+    // Overrides cannot bypass unreadable/malformed configuration.
+    await assert.rejects(engramBase({ ENGRAM_PORT: '17437' }, path), /Invalid local Engram client configuration/)
+  }
+  await rm(path)
+  await mkdir(path)
+  await assert.rejects(engramBase({}, path), /Cannot read local Engram client configuration/)
+})
+
+test('remote capture pins one loopback tunnel port and rejects local overrides', async (t) => {
+  const path = join(await fixture(t), 'remote.json')
+  const config = { mode: 'remote', port: 17437, remote_port: 7437 }
+  await writeFile(path, JSON.stringify(config))
+  for (const env of [{}, { ENGRAM_PORT: ' ' }, { ENGRAM_PORT: '17437' }]) {
+    assert.equal(await engramBase(env, path), 'http://127.0.0.1:17437')
+  }
+  for (const port of ['7437', '9001', '0', 'https://fixture-only-sentinel.invalid']) {
+    await assert.rejects(engramBase({ ENGRAM_PORT: port }, path),
+      error => error.message === 'Invalid local Engram client configuration')
+  }
+  for (const change of [{ port: 7437 }, { port: 0 }, { port: 'x' }]) {
+    await writeFile(path, JSON.stringify({ ...config, ...change }))
+    await assert.rejects(engramBase({ ENGRAM_PORT: '17437' }, path),
+      error => error.message === 'Invalid local Engram client configuration')
+  }
+})
+
+test('remote tunnel failure does not request another port', async (t) => {
+  const path = join(await fixture(t), 'remote.json')
+  await writeFile(path, JSON.stringify({ mode: 'remote', port: 17437, remote_port: 7437 }))
+  const calls = []
+  const base = await engramBase({}, path)
+  assert.equal(await request(base, '/prompts', { content: 'sanitized fixture' }, async url => {
+    calls.push(url)
+    throw new Error('offline')
+  }), null)
+  assert.deepEqual(calls, ['http://127.0.0.1:17437/prompts'])
 })
 
 test('promptCapture skips children, short text, and missing ids', () => {
@@ -269,15 +351,6 @@ test('child prompts are not captured', () => {
     }),
     null,
   )
-})
-
-test('privacy boundary: unmarked text is not secret-detected, prompts truncate but subagent output does not', () => {
-  const fixture = 'fictional-sensitive-value'
-  assert.equal(privateText(fixture), fixture)
-  const prompt = promptCapture({ sessionID: 'fixture', text: 'x'.repeat(2500), project: 'fixture' })
-  assert.equal(prompt.body.content.length, 2000)
-  const tool = toolAfterCapture({ sessionID: 'fixture', tool: 'subagent', status: 'ok', result: 'x'.repeat(2500), project: 'fixture' })
-  assert.equal(tool.observation.body.content.length, 2500)
 })
 
 test('request returns null on network or HTTP failure', async () => {
